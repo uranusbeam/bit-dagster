@@ -1,0 +1,20 @@
+[tool.black]
+line-length = 100
+skip-string-normalization = 1
+exclude = '''
+/(
+    build
+  | buck-out
+  | dist
+  | _build
+  | \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.nox
+  | \.tox
+  | \.venv
+  | snapshots
+)/
+'''
+target_version = ['py27', 'py35', 'py36', 'py37', 'py38']

@@ -1,0 +1,21 @@
+{
+  "linters": {
+    "pylint": {
+      "type": "pylint",
+      "pylint.config": ".pylintrc",
+      "include": "(\\.py$)"
+    },
+    "isort": {
+      "type": "isort",
+      "include": "(\\.py$)",
+      "exclude": "(examples/dagster_examples/intro_tutorial/)"
+    },
+    "eslint": {
+      "type": "eslint",
+      "include": "(js_modules/dagit/.*\\.(ts|tsx)$)",
+      "flags": ["--resolve-plugins-relative-to", "./js_modules/dagit"],
+      "eslint.cwd": "./js_modules/dagit",
+      "eslint.config": "./js_modules/dagit/.eslintrc.js"
+    }
+  }
+}

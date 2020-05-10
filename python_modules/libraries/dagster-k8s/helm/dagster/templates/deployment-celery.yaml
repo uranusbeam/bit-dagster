@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dagster.workers.fullname" . }}
+  labels:
+    {{- include "dagster.labels" . | nindent 4 }}
+    component: celery
+spec:
+  replicas: {{ .Values.celery.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "dagster.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dagster.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/dagster-instance: {{ include (print $.Template.BasePath "/configmap-instance.yaml") . | sha256sum }}
+    spec:
+    {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+      serviceAccountName: {{ include "dagster.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.celery.podSecurityContext | nindent 8 }}
+      initContainers:
+        - name: check-db-ready
+          image: postgres:9.6.16
+          command: ['sh', '-c',
+            'until pg_isready -h {{ include "dagster.postgresql.host" . }} -p {{ .Values.postgresql.service.port }}; do echo waiting for database; sleep 2; done;',
+            ]
+          securityContext:
+            {{- toYaml .Values.celery.securityContext | nindent 12 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.celery.securityContext | nindent 12 }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          image: "{{ template "dagster.job_image" . }}"
+          command: ["dagster-celery"]
+          args: ["worker", "start", "-y", "{{ .Values.dagster_home }}/celery-config.yaml", "-q", "dagster"]
+          env:
+            - name: DAGSTER_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: "{{ template "dagster.fullname" . }}-postgresql-secret"
+                  key: postgresql-password
+          envFrom:
+            - configMapRef:
+                name: {{ template "dagster.fullname" . }}-job-runner-env
+            {{- if .Values.job_runner.env_config_maps -}}
+            {{- range $name := .Values.job_runner.env_config_maps }}
+            {{- if $name }}
+            - configMapRef:
+                name: {{ $name }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.job_runner.env_secrets -}}
+            {{- range $name := .Values.job_runner.env_secrets }}
+            {{- if $name }}
+            - secretRef:
+                name: {{ $name }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+          volumeMounts:
+            - name: dagster-instance
+              mountPath: "{{ .Values.dagster_home }}/dagster.yaml"
+              subPath: dagster.yaml
+            - name: dagster-celery
+              mountPath: "{{ .Values.dagster_home }}/celery-config.yaml"
+              subPath: celery.yaml
+          resources:
+            {{- toYaml .Values.celery.resources | nindent 12 }}
+      {{- with .Values.celery.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: dagster-instance
+          configMap:
+            name: {{ template "dagster.fullname" . }}-instance
+        - name: dagster-celery
+          configMap:
+            name: {{ template "dagster.fullname" . }}-celery
+    {{- with .Values.celery.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    {{- with .Values.celery.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}

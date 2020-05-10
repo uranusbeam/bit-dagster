@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dagster.dagit.fullname" . }}
+  labels:
+    {{- include "dagster.labels" . | nindent 4 }}
+    component: dagit
+spec:
+  replicas: {{ .Values.dagit.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "dagster.selectorLabels" . | nindent 6 }}
+      component: dagit
+  template:
+    metadata:
+      labels:
+        {{- include "dagster.selectorLabels" . | nindent 8 }}
+        component: dagit
+      annotations:
+        checksum/dagster-instance: {{ include (print $.Template.BasePath "/configmap-instance.yaml") . | sha256sum }}
+    spec:
+    {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+      serviceAccountName: {{ include "dagster.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.dagit.podSecurityContext | nindent 8 }}
+      initContainers:
+        - name: check-db-ready
+          image: postgres:9.6.16
+          command: ['sh', '-c',
+            'until pg_isready -h {{ include "dagster.postgresql.host" . }} -p {{ .Values.postgresql.service.port }}; do echo waiting for database; sleep 2; done;',
+            ]
+          securityContext:
+            {{- toYaml .Values.dagit.securityContext | nindent 12 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.dagit.securityContext | nindent 12 }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          image: "{{ template "dagster.dagit_image" . }}"
+          command: [
+            "/bin/bash",
+            "-c",
+            "service cron start && \
+            /usr/local/bin/dagster schedule up && \
+            dagit -h 0.0.0.0 -p 80"
+          ]
+          env:
+            - name: DAGSTER_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: "{{ template "dagster.fullname" . }}-postgresql-secret"
+                  key: postgresql-password
+          envFrom:
+            - configMapRef:
+                name: {{ template "dagster.fullname" . }}-dagit-env
+            {{- if .Values.dagit.env_config_maps -}}
+            {{- range $name := .Values.dagit.env_config_maps }}
+            {{- if $name }}
+            - configMapRef:
+                name: {{ $name }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.dagit.env_secrets -}}
+            {{- range $name := .Values.dagit.env_secrets }}
+            {{- if $name }}
+            - secretRef:
+                name: {{ $name }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+          volumeMounts:
+            - name: dagster-instance
+              mountPath: "{{ .Values.dagster_home }}/dagster.yaml"
+              subPath: dagster.yaml
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          resources:
+            {{- toYaml .Values.dagit.resources | nindent 12 }}
+      {{- with .Values.dagit.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      volumes:
+        - name: dagster-instance
+          configMap:
+            name: {{ template "dagster.fullname" . }}-instance
+    {{- with .Values.dagit.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    {{- with .Values.dagit.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
