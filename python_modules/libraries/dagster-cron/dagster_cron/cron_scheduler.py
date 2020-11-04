@@ -5,21 +5,22 @@ import stat
 
 import six
 from crontab import CronTab
-
-from dagster import DagsterInstance, DagsterInvariantViolationError, check, seven, utils
-from dagster.core.definitions import RepositoryDefinition
-from dagster.core.scheduler import ScheduleStatus, Scheduler
+from dagster import DagsterInstance, check, utils
+from dagster.core.host_representation import ExternalSchedule
+from dagster.core.scheduler import DagsterSchedulerError, Scheduler
 from dagster.serdes import ConfigurableClass
 
 
 class SystemCronScheduler(Scheduler, ConfigurableClass):
-    '''Scheduler implementation that uses the local systems cron. Only works on unix systems that
+    """Scheduler implementation that uses the local systems cron. Only works on unix systems that
     have cron.
 
     Enable this scheduler by adding it to your ``dagster.yaml`` in ``$DAGSTER_HOME``.
-    '''
+    """
 
-    def __init__(self, inst_data=None):
+    def __init__(
+        self, inst_data=None,
+    ):
         self._inst_data = inst_data
 
     @property
@@ -34,66 +35,72 @@ class SystemCronScheduler(Scheduler, ConfigurableClass):
     def from_config_value(inst_data, config_value):
         return SystemCronScheduler(inst_data=inst_data)
 
-    def start_schedule(self, instance, repository, schedule_name):
-        schedule = instance.get_schedule_by_name(repository, schedule_name)
-        if not schedule:
-            raise DagsterInvariantViolationError(
-                'You have attempted to start schedule {name}, but it does not exist.'.format(
-                    name=schedule_name
+    def get_cron_tab(self):
+        return CronTab(user=True)
+
+    def debug_info(self):
+        return "Running Cron Jobs:\n{jobs}\n".format(
+            jobs="\n".join(
+                [str(job) for job in self.get_cron_tab() if "dagster-schedule:" in job.comment]
+            )
+        )
+
+    def start_schedule(self, instance, external_schedule):
+        check.inst_param(instance, "instance", DagsterInstance)
+        check.inst_param(external_schedule, "external_schedule", ExternalSchedule)
+        schedule_origin_id = external_schedule.get_origin_id()
+
+        # If the cron job already exists, remove it. This prevents duplicate entries.
+        # Then, add a new cron job to the cron tab.
+        if self.running_schedule_count(instance, external_schedule.get_origin_id()) > 0:
+            self._end_cron_job(instance, schedule_origin_id)
+
+        self._start_cron_job(instance, external_schedule)
+
+        # Verify that the cron job is running
+        running_schedule_count = self.running_schedule_count(instance, schedule_origin_id)
+        if running_schedule_count == 0:
+            raise DagsterSchedulerError(
+                "Attempted to write cron job for schedule "
+                "{schedule_name}, but failed. "
+                "The scheduler is not running {schedule_name}.".format(
+                    schedule_name=external_schedule.name
+                )
+            )
+        elif running_schedule_count > 1:
+            raise DagsterSchedulerError(
+                "Attempted to write cron job for schedule "
+                "{schedule_name}, but duplicate cron jobs were found. "
+                "There are {running_schedule_count} jobs running for the schedule."
+                "To resolve, run `dagster schedule up`, or edit the cron tab to "
+                "remove duplicate schedules".format(
+                    schedule_name=external_schedule.name,
+                    running_schedule_count=running_schedule_count,
                 )
             )
 
-        if schedule.status == ScheduleStatus.RUNNING:
-            raise DagsterInvariantViolationError(
-                'You have attempted to start schedule {name}, but it is already running'.format(
-                    name=schedule_name
+    def stop_schedule(self, instance, schedule_origin_id):
+        check.inst_param(instance, "instance", DagsterInstance)
+        check.str_param(schedule_origin_id, "schedule_origin_id")
+
+        schedule = self._get_schedule_state(instance, schedule_origin_id)
+
+        self._end_cron_job(instance, schedule_origin_id)
+
+        # Verify that the cron job has been removed
+        running_schedule_count = self.running_schedule_count(instance, schedule_origin_id)
+        if running_schedule_count > 0:
+            raise DagsterSchedulerError(
+                "Attempted to remove existing cron job for schedule "
+                "{schedule_name}, but failed. "
+                "There are still {running_schedule_count} jobs running for the schedule.".format(
+                    schedule_name=schedule.name, running_schedule_count=running_schedule_count
                 )
             )
-
-        started_schedule = schedule.with_status(ScheduleStatus.RUNNING)
-        self._start_cron_job(instance, repository, started_schedule)
-        instance.update_schedule(repository, started_schedule)
-
-        return started_schedule
-
-    def stop_schedule(self, instance, repository, schedule_name):
-        schedule = instance.get_schedule_by_name(repository, schedule_name)
-        if not schedule:
-            raise DagsterInvariantViolationError(
-                'You have attempted to stop schedule {name}, but was never initialized.'
-                'Use `schedule up` to initialize schedules'.format(name=schedule_name)
-            )
-
-        if schedule.status == ScheduleStatus.STOPPED:
-            raise DagsterInvariantViolationError(
-                'You have attempted to stop schedule {name}, but it is already stopped'.format(
-                    name=schedule_name
-                )
-            )
-
-        stopped_schedule = schedule.with_status(ScheduleStatus.STOPPED)
-        self._end_cron_job(instance, repository, stopped_schedule)
-        instance.update_schedule(repository, stopped_schedule)
-
-        return stopped_schedule
-
-    def end_schedule(self, instance, repository, schedule_name):
-        schedule = instance.get_schedule_by_name(repository, schedule_name)
-        if not schedule:
-            raise DagsterInvariantViolationError(
-                'You have attempted to end schedule {name}, but it is not running.'.format(
-                    name=schedule_name
-                )
-            )
-
-        instance.delete_schedule(repository, schedule)
-        self._end_cron_job(instance, repository, schedule)
-
-        return schedule
 
     def wipe(self, instance):
         # Note: This method deletes schedules from ALL repositories
-        check.inst_param(instance, 'instance', DagsterInstance)
+        check.inst_param(instance, "instance", DagsterInstance)
 
         # Delete all script files
         script_directory = os.path.join(instance.schedules_directory(), "scripts")
@@ -106,75 +113,96 @@ class SystemCronScheduler(Scheduler, ConfigurableClass):
             shutil.rmtree(logs_directory)
 
         # Remove all cron jobs
-        cron = CronTab(user=True)
-        for job in cron:
-            if 'dagster-schedule:' in job.comment:
-                cron.remove_all(comment=job.comment)
+        with self.get_cron_tab() as cron_tab:
+            for job in cron_tab:
+                if "dagster-schedule:" in job.comment:
+                    cron_tab.remove_all(comment=job.comment)
 
-        cron.write()
-
-    def _get_bash_script_file_path(self, instance, repository, schedule):
-        check.inst_param(instance, 'instance', DagsterInstance)
+    def _get_bash_script_file_path(self, instance, schedule_origin_id):
+        check.inst_param(instance, "instance", DagsterInstance)
+        check.str_param(schedule_origin_id, "schedule_origin_id")
 
         script_directory = os.path.join(instance.schedules_directory(), "scripts")
         utils.mkdir_p(script_directory)
 
-        script_file_name = "{}.{}.sh".format(repository.name, schedule.name)
+        script_file_name = "{}.sh".format(schedule_origin_id)
         return os.path.join(script_directory, script_file_name)
 
-    def _start_cron_job(self, instance, repository, schedule):
-        script_file = self._write_bash_script_to_file(instance, repository, schedule)
-
-        my_cron = CronTab(user=True)
-        job = my_cron.new(
-            command=script_file,
-            comment='dagster-schedule: {repository_name}.{schedule_name}'.format(
-                repository_name=repository.name, schedule_name=schedule.name
-            ),
+    def _cron_tag_for_schedule(self, schedule_origin_id):
+        return "dagster-schedule: {schedule_origin_id}".format(
+            schedule_origin_id=schedule_origin_id
         )
-        job.setall(schedule.cron_schedule)
-        my_cron.write()
 
-    def _end_cron_job(self, instance, repository, schedule):
-        my_cron = CronTab(user=True)
-        my_cron.remove_all(
-            comment='dagster-schedule: {repository_name}.{schedule_name}'.format(
-                repository_name=repository.name, schedule_name=schedule.name
-            ),
+    def _get_command(self, script_file, instance, schedule_origin_id):
+        schedule_log_file_path = self.get_logs_path(instance, schedule_origin_id)
+        command = "{script_file} > {schedule_log_file_path} 2>&1".format(
+            script_file=script_file, schedule_log_file_path=schedule_log_file_path
         )
-        my_cron.write()
 
-        script_file = self._get_bash_script_file_path(instance, repository, schedule)
+        return command
+
+    def _start_cron_job(self, instance, external_schedule):
+        schedule_origin_id = external_schedule.get_origin_id()
+        script_file = self._write_bash_script_to_file(instance, external_schedule)
+        command = self._get_command(script_file, instance, schedule_origin_id)
+
+        with self.get_cron_tab() as cron_tab:
+            job = cron_tab.new(
+                command=command,
+                comment="dagster-schedule: {schedule_origin_id}".format(
+                    schedule_origin_id=schedule_origin_id
+                ),
+            )
+            job.setall(external_schedule.cron_schedule)
+
+    def _end_cron_job(self, instance, schedule_origin_id):
+        with self.get_cron_tab() as cron_tab:
+            cron_tab.remove_all(comment=self._cron_tag_for_schedule(schedule_origin_id))
+
+        script_file = self._get_bash_script_file_path(instance, schedule_origin_id)
         if os.path.isfile(script_file):
             os.remove(script_file)
 
-    def get_log_path(self, instance, repository, schedule_name):
-        check.inst_param(instance, 'instance', DagsterInstance)
-        check.inst_param(repository, 'repository', RepositoryDefinition)
-        check.str_param(schedule_name, 'schedule_name')
+    def running_schedule_count(self, instance, schedule_origin_id):
+        matching_jobs = self.get_cron_tab().find_comment(
+            self._cron_tag_for_schedule(schedule_origin_id)
+        )
 
-        logs_directory = os.path.join(instance.schedules_directory(), "logs")
-        schedule_logs_directory = os.path.join(logs_directory, repository.name, schedule_name)
-        return schedule_logs_directory
+        return len(list(matching_jobs))
 
-    def _write_bash_script_to_file(self, instance, repository, schedule):
+    def _get_or_create_logs_directory(self, instance, schedule_origin_id):
+        check.inst_param(instance, "instance", DagsterInstance)
+        check.str_param(schedule_origin_id, "schedule_origin_id")
+
+        logs_directory = os.path.join(instance.schedules_directory(), "logs", schedule_origin_id)
+        if not os.path.isdir(logs_directory):
+            utils.mkdir_p(logs_directory)
+
+        return logs_directory
+
+    def get_logs_path(self, instance, schedule_origin_id):
+        check.inst_param(instance, "instance", DagsterInstance)
+        check.str_param(schedule_origin_id, "schedule_origin_id")
+
+        logs_directory = self._get_or_create_logs_directory(instance, schedule_origin_id)
+        return os.path.join(logs_directory, "scheduler.log")
+
+    def _write_bash_script_to_file(self, instance, external_schedule):
         # Get path to store bash script
-        script_file = self._get_bash_script_file_path(instance, repository, schedule)
+        schedule_origin_id = external_schedule.get_origin_id()
+        script_file = self._get_bash_script_file_path(instance, schedule_origin_id)
 
         # Get path to store schedule attempt logs
-        schedule_logs_path = self.get_log_path(instance, repository, schedule.name)
-        if not os.path.isdir(schedule_logs_path):
-            utils.mkdir_p(schedule_logs_path)
-        schedule_log_file_name = "{}_{}.result".format("${RUN_DATE}", schedule.name)
-        schedule_log_file_path = os.path.join(schedule_logs_path, schedule_log_file_name)
+        logs_directory = self._get_or_create_logs_directory(instance, schedule_origin_id)
+        schedule_log_file_name = "{}_{}.result".format("${RUN_DATE}", schedule_origin_id)
+        schedule_log_file_path = os.path.join(logs_directory, schedule_log_file_name)
+
+        local_target = external_schedule.get_origin()
 
         # Environment information needed for execution
-        dagster_graphql_path = os.path.join(
-            os.path.dirname(schedule.python_path), 'dagster-graphql'
-        )
-        dagster_home = os.getenv('DAGSTER_HOME')
+        dagster_home = os.getenv("DAGSTER_HOME")
 
-        script_contents = '''
+        script_contents = """
             #!/bin/bash
             export DAGSTER_HOME={dagster_home}
             export LANG=en_US.UTF-8
@@ -182,22 +210,22 @@ class SystemCronScheduler(Scheduler, ConfigurableClass):
 
             export RUN_DATE=$(date "+%Y%m%dT%H%M%S")
 
-            {dagster_graphql_path} -p startScheduledExecution -v '{variables}' -y "{repo_path}" --output "{result_file}"
-        '''.format(
-            dagster_graphql_path=dagster_graphql_path,
-            repo_path=schedule.repository_path,
-            variables=seven.json.dumps({"scheduleName": schedule.name}),
+            {python_exe} -m dagster api launch_scheduled_execution --schedule_name {schedule_name} {repo_cli_args} "{result_file}"
+        """.format(
+            python_exe=local_target.executable_path,
+            schedule_name=external_schedule.name,
+            repo_cli_args=local_target.get_repo_cli_args(),
             result_file=schedule_log_file_path,
             dagster_home=dagster_home,
             env_vars="\n".join(
                 [
                     "export {key}={value}".format(key=key, value=value)
-                    for key, value in schedule.environment_vars.items()
+                    for key, value in external_schedule.environment_vars.items()
                 ]
             ),
         )
 
-        with io.open(script_file, 'w', encoding='utf-8') as f:
+        with io.open(script_file, "w", encoding="utf-8") as f:
             f.write(six.text_type(script_contents))
 
         st = os.stat(script_file)
