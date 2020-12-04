@@ -32,7 +32,7 @@
     "gatsby-image": "^2.2.41",
     "gatsby-link": "^2.2.29",
     "gatsby-react-router-scroll": "^2.1.21",
-    "highlight.js": "^9.18.1",
+    "highlight.js": "^10.4.1",
     "immer": "^5.3.6",
     "parse5-traverse": "^1.0.3",
     "path-browserify": "^1.0.0",
