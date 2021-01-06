@@ -12,7 +12,7 @@
     "@types/react-instantsearch-dom": "^6.3.0",
     "@zeit/next-sass": "^1.0.1",
     "algoliasearch": "^4.1.0",
-    "axios": "^0.19.2",
+    "axios": "^0.21.1",
     "axios-hooks": "^1.9.0",
     "classnames": "^2.2.6",
     "fast-glob": "^3.2.2",
